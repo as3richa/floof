@@ -60,104 +60,60 @@ pub trait InternalFilter {
     fn table_entries(&self) -> usize;
     fn table_entries_per_block(&self) -> u32;
     unsafe fn table_entry(&self, index: usize) -> &Block;
-
-    fn blocks_bits(&self) -> u32 {
-        bits(self.blocks())
-    }
-
-    fn table_entries_bits(&self) -> u32 {
-        bits(self.table_entries())
-    }
-
-    fn hash_bits(&self) -> u32 {
-        (self.table_entries_bits() * self.table_entries_per_block() + self.blocks_bits())
-            * self.blocks_per_elem()
-    }
 }
 
 pub trait Filter {
-    fn insert64(&mut self, hash: u64);
-    fn insert32(&mut self, hash: u32);
-
-    fn contains64(&self, hash: u64) -> bool;
-    fn contains32(&self, hash: u32) -> bool;
+    fn hash_bits(&self) -> u32;
+    fn insert_hash(&mut self, hash: u64);
+    fn contains_hash(&self, hash: u64) -> bool;
 }
 
-macro_rules! compute_block {
-    ($self: ident, $hash: expr, $extract: ident) => {{
-        let (bits0, hash0) = $extract($hash, $self.table_entries());
-        let mut block = unsafe { $self.table_entry(bits0) }.clone();
-        let mut hash = hash0;
+impl<T: InternalFilter> Filter for T {
+    fn hash_bits(&self) -> u32 {
+        (bits(self.table_entries()) * self.table_entries_per_block() + bits(self.blocks()))
+            * self.blocks_per_elem()
+    }
 
-        for _ in 1..$self.table_entries_per_block() {
-            let (bits, hash2) = $extract(hash, $self.table_entries());
-            block.merge(unsafe { $self.table_entry(bits) });
-            hash = hash2;
-        }
-
-        (block, hash)
-    }};
-}
-
-macro_rules! insert {
-    ($self: ident, $hash: expr, $extract: ident) => {{
-        let mut hash = $hash;
-        for _ in 0..$self.blocks_per_elem() {
-            let (block, hash2) = compute_block!($self, hash, $extract);
-            let (index, hash3) = $extract(hash2, $self.blocks());
+    fn insert_hash(&mut self, mut hash: u64) {
+        debug_assert!(self.hash_bits() <= 64);
+        for _ in 0..self.blocks_per_elem() {
+            let (block, hash2) = compute_block(self, hash);
+            let (index, hash3) = extract_from_hash(hash2, self.blocks());
             unsafe {
-                $self.block_mut(index).merge(&block);
+                self.block_mut(index).merge(&block);
             }
             hash = hash3;
         }
-    }};
-}
+    }
 
-macro_rules! contains {
-    ($self: ident, $hash: expr, $extract: ident) => {{
-        let mut hash = $hash;
-        for _ in 0..$self.blocks_per_elem() {
-            let (block, hash2) = compute_block!($self, hash, $extract);
-            let (index, hash3) = $extract(hash2, $self.blocks());
-            if !unsafe { $self.block(index).contains(&block) } {
+    fn contains_hash(&self, mut hash: u64) -> bool {
+        for _ in 0..self.blocks_per_elem() {
+            let (block, hash2) = compute_block(self, hash);
+            let (index, hash3) = extract_from_hash(hash2, self.blocks());
+            if !unsafe { self.block(index).contains(&block) } {
                 return false;
             }
             hash = hash3;
         }
         return true;
-    }};
-}
-
-impl<T: InternalFilter> Filter for T {
-    fn insert64(&mut self, hash: u64) {
-        debug_assert!(self.hash_bits() <= 64);
-        insert!(self, hash, extract64);
-    }
-
-    fn insert32(&mut self, hash: u32) {
-        debug_assert!(self.hash_bits() <= 32);
-        insert!(self, hash, extract32);
-    }
-
-    fn contains64(&self, hash: u64) -> bool {
-        debug_assert!(self.hash_bits() <= 64);
-        contains!(self, hash, extract64);
-    }
-
-    fn contains32(&self, hash: u32) -> bool {
-        debug_assert!(self.hash_bits() <= 32);
-        contains!(self, hash, extract32);
     }
 }
 
-fn extract64(hash: u64, n: usize) -> (usize, u64) {
-    let bits = bits(n);
-    let unscaled = hash & ((1 << bits) - 1);
-    let scaled = (unscaled as f64) * (n as f64) / ((1 << bits) as f64);
-    (scaled as usize, hash >> bits)
+fn compute_block<T: InternalFilter>(filter: &T, mut hash: u64) -> (Block, u64) {
+    let (index0, hash0) = extract_from_hash(hash, filter.table_entries());
+    let mut block = unsafe { filter.table_entry(index0) }.clone();
+    hash = hash0;
+
+    for _ in 1..filter.table_entries_per_block() {
+        let (index, hash2) = extract_from_hash(hash, filter.table_entries());
+        block.merge(unsafe { filter.table_entry(index) });
+        hash = hash2;
+    }
+
+    (block, hash)
 }
 
-fn extract32(hash: u32, n: usize) -> (usize, u32) {
+fn extract_from_hash(hash: u64, n: usize) -> (usize, u64) {
     let bits = bits(n);
     let unscaled = hash & ((1 << bits) - 1);
     let scaled = (unscaled as f64) * (n as f64) / ((1 << bits) as f64);
@@ -168,15 +124,58 @@ fn bits(n: usize) -> u32 {
     ((8 * size_of::<usize>()) as u32) - n.leading_zeros()
 }
 
-pub trait Hashable64<A> {
-    fn hash(value: A) -> u64;
-}
-
-pub trait Hashable32<A> {
-    fn hash(value: A) -> u32;
+pub trait Hashable {
+    fn hash(&self) -> u64;
 }
 
 pub trait TypedFilter<A> {
-    fn insert(value: &A);
-    fn contains(value: &A);
+    fn insert(&mut self, value: A);
+
+    fn contains(&self, value: A) -> bool;
+}
+
+impl<F: Filter, A: Hashable> TypedFilter<A> for F {
+    fn insert(&mut self, value: A) {
+        self.insert_hash(value.hash())
+    }
+
+    fn contains(&self, value: A) -> bool {
+        self.contains_hash(value.hash())
+    }
+}
+
+pub struct SimpleFilter {
+    all_blocks: Vec<Block>,
+    table_entries: usize,
+}
+
+impl InternalFilter for SimpleFilter {
+    fn blocks(&self) -> usize {
+        self.all_blocks.len() - self.table_entries()
+    }
+
+    fn blocks_per_elem(&self) -> u32 {
+        1
+    }
+
+    unsafe fn block(&self, index: usize) -> &Block {
+        self.all_blocks.get_unchecked(self.table_entries + index)
+    }
+
+    unsafe fn block_mut(&mut self, index: usize) -> &mut Block {
+        self.all_blocks
+            .get_unchecked_mut(self.table_entries + index)
+    }
+
+    fn table_entries(&self) -> usize {
+        self.table_entries
+    }
+
+    fn table_entries_per_block(&self) -> u32 {
+        1
+    }
+
+    unsafe fn table_entry(&self, index: usize) -> &Block {
+        self.all_blocks.get_unchecked(index)
+    }
 }
