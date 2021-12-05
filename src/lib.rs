@@ -1,7 +1,15 @@
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-use core::arch::x86_64::{__m256i, _mm256_or_si256, _mm256_testc_si256};
+#![feature(maybe_uninit_extra)]
 
-use core::mem::size_of;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+use core::arch::x86_64::{__m256i, _mm256_or_si256, _mm256_setzero_si256, _mm256_testc_si256};
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+use core::mem::transmute;
+
+use rand::Rng;
+
+use core::mem::{size_of, MaybeUninit};
+use core::ptr::drop_in_place;
 
 #[derive(Clone)]
 #[repr(align(64))]
@@ -14,6 +22,58 @@ pub struct Block {
 }
 
 impl Block {
+    pub fn new() -> Block {
+        Block {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            data: [unsafe { _mm256_setzero_si256() }; 2],
+
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            data: [0; 16],
+        }
+    }
+
+    pub fn random<R: Rng>(ones: u8, rng: &mut R) -> Block {
+        let mut one_bits: [MaybeUninit<u16>; 256] = unsafe { MaybeUninit::uninit().assume_init() };
+
+        for (bit, ptr) in one_bits[0..(ones as usize)].iter_mut().enumerate() {
+            ptr.write(bit as u16);
+        }
+
+        let mut i = (ones as usize) + 1;
+        let mut w = (rng.gen::<f64>().ln()/(ones as f64)).exp();
+
+        while i < 512 {
+            i += (rng.gen::<f64>().ln()/(1.0 - w).ln()).floor() as usize;
+            if i < 512 {
+                one_bits[rng.gen_range(0..(ones as usize))] = MaybeUninit::new(i as u16);
+                w*= (rng.gen::<f64>().ln() / (ones as f64)).exp();
+            }
+        }
+
+        let mut data: [u32; 16] = [0; 16];
+
+        for ptr in one_bits[0..(ones as usize)].iter_mut() {
+            let index = unsafe { ptr.read() };
+            data[(index as usize) / 32] |= 1 << ((index as usize) % 32);
+
+            unsafe {
+                drop_in_place(ptr.as_mut_ptr());
+            }
+        }
+
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            Block {
+                data: unsafe { transmute::<_, [__m256i; 2]>(data) },
+            }
+        }
+
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            Block { data: data }
+        }
+    }
+
     fn merge(&mut self, block: &Block) {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         for i in 0..2 {
@@ -75,7 +135,6 @@ impl<T: InternalFilter> Filter for T {
     }
 
     fn insert_hash(&mut self, mut hash: u64) {
-        debug_assert!(self.hash_bits() <= 64);
         for _ in 0..self.blocks_per_elem() {
             let (block, hash2) = compute_block(self, hash);
             let (index, hash3) = extract_from_hash(hash2, self.blocks());
@@ -144,12 +203,21 @@ impl<F: Filter, A: Hashable> TypedFilter<A> for F {
     }
 }
 
-pub struct SimpleFilter {
+pub struct BlockedFilter {
     all_blocks: Vec<Block>,
     table_entries: usize,
 }
 
-impl InternalFilter for SimpleFilter {
+impl BlockedFilter {
+    pub fn new(blocks: usize, table_entries: usize, bits_per_entry: u32) -> BlockedFilter {
+        BlockedFilter {
+            all_blocks: vec![Block::new(); blocks + table_entries],
+            table_entries: 0,
+        }
+    }
+}
+
+impl InternalFilter for BlockedFilter {
     fn blocks(&self) -> usize {
         self.all_blocks.len() - self.table_entries()
     }
