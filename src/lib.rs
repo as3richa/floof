@@ -1,16 +1,19 @@
 #![allow(clippy::missing_safety_doc)]
-#![feature(min_const_generics)]
 #![feature(maybe_uninit_extra)]
+#![feature(min_const_generics)]
+
+use core::mem::MaybeUninit;
+use rand::Rng;
+use std::io::{Result as IoResult, Write};
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use core::arch::x86_64::{
-    __m256i, _mm256_load_si256, _mm256_or_si256, _mm256_store_si256, _mm256_testc_si256,
+    __m256i, _mm256_load_si256, _mm256_or_si256, _mm256_setzero_si256, _mm256_store_si256,
+    _mm256_testc_si256,
 };
 
-use rand::Rng;
-
-use core::mem::MaybeUninit;
-use std::io::{Result as IoResult, Write};
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+use core::mem::transmute;
 
 #[derive(Clone, Default)]
 #[repr(C, align(64))]
@@ -22,8 +25,10 @@ impl Block {
     const WORDS: usize = 16;
     const BYTES: usize = 64;
     const BITS: usize = 512;
+
     pub fn random<R: Rng>(ones: u32, rng: &mut R) -> Block {
-        assert!(ones <= Block::BITS as u32);
+        // FIXME: check in caller!
+        debug_assert!(ones <= Block::BITS as u32);
 
         let mut one_bits: [MaybeUninit<u16>; Block::BITS] =
             unsafe { MaybeUninit::uninit().assume_init() };
@@ -45,7 +50,7 @@ impl Block {
             }
         }
 
-        let mut data: [u32; Block::WORDS] = [0; Block::WORDS];
+        let mut data = [0u32; Block::WORDS];
 
         for ptr in one_bits[0..(ones as usize)].iter_mut() {
             let index = unsafe { ptr.read() };
@@ -58,27 +63,60 @@ impl Block {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     unsafe fn load_mm256i(&self, index: usize) -> __m256i {
         debug_assert!(index < 2);
-        _mm256_load_si256(&self.data[index * 8] as *const u32 as *const __m256i)
-    }
-
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    unsafe fn store_mm256i(&mut self, index: usize, value: __m256i) {
-        debug_assert!(index < 2);
-        _mm256_store_si256(&mut self.data[index * 8] as *mut u32 as *mut __m256i, value);
+        _mm256_load_si256(self.data.as_ptr().add(index * 8) as *const __m256i)
     }
 
     fn merge(&mut self, block: &Block) {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        for i in 0..2 {
-            unsafe {
-                let merged = _mm256_or_si256(self.load_mm256i(i), block.load_mm256i(i));
-                self.store_mm256i(i, merged);
-            }
+        unsafe {
+            let x = _mm256_or_si256(self.load_mm256i(0), block.load_mm256i(0));
+            let y = _mm256_or_si256(self.load_mm256i(1), block.load_mm256i(1));
+
+            _mm256_store_si256(self.data.as_mut_ptr() as *mut __m256i, x);
+            _mm256_store_si256(self.data.as_mut_ptr().add(8) as *mut __m256i, y);
         }
 
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         for i in 0..Block::WORDS {
             self.data[i] |= block.data[i];
+        }
+    }
+
+    fn merge_many<'a, I: Iterator<Item = &'a Block>>(blocks: I) -> Block {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        unsafe {
+            let mut x = _mm256_setzero_si256();
+            let mut y = _mm256_setzero_si256();
+
+            for block in blocks {
+                x = _mm256_or_si256(x, block.load_mm256i(0));
+                y = _mm256_or_si256(y, block.load_mm256i(1));
+            }
+
+            let mut data: [MaybeUninit<u32>; Block::WORDS] = MaybeUninit::uninit().assume_init();
+
+            _mm256_store_si256(data.as_mut_ptr() as *mut __m256i, x);
+            _mm256_store_si256(data.as_mut_ptr().add(8) as *mut __m256i, x);
+
+            Block {
+                data: transmute(data),
+            }
+        }
+
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            let mut blocks = blocks;
+            if let Some(first) = blocks.next() {
+                let mut merged = first.clone();
+                for block in blocks {
+                    for i in 0..Block::WORDS {
+                        merged.data[i] |= block.data[i];
+                    }
+                }
+                merged
+            } else {
+                Block::default()
+            }
         }
     }
 
@@ -103,8 +141,10 @@ impl Block {
 
 mod private_filter {
     use crate::{extract_index_from_hash, Block};
-
     use core::slice;
+    use rand::Rng;
+
+    const MAGIC_NUMBER: u32 = 0xf100f001;
 
     pub trait Filter<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32> {
         fn blocks(&self) -> u32;
@@ -113,33 +153,76 @@ mod private_filter {
         fn buffer(&self) -> *const Block;
         fn buffer_mut(&mut self) -> *mut Block;
 
+        // Key assumption: buffer_len overflows neither u32 nor platform usize
+        // (enforced with buffer_len_assert_bounds in the constructors of individual Filter implementations)
         fn buffer_len(&self) -> u32 {
             1 + self.blocks() + self.table_entries()
         }
 
-        unsafe fn block(&self, index: u32) -> &Block {
+        fn buffer_len_assert_bounds(blocks: u32, table_entries: u32) -> Result<u32, ()> {
+            let len = 1u32
+                .checked_add(blocks)
+                .and_then(|x| x.checked_add(table_entries))
+                .map_or(Err(()), Ok)?; // len overflows u32
+
+            #[cfg(target_pointer_width = "16")]
+            if len > usize::MAX {
+                return Err(()); // len overflows usize (possible only if usize is less than 32 bits)
+            }
+
+            Ok(len)
+        }
+
+        unsafe fn header_mut(&mut self) -> *mut Block {
+            &mut *self.buffer_mut()
+        }
+
+        unsafe fn table_entry(&self, index: u32) -> *const Block {
+            debug_assert!(index < self.table_entries());
+            &*self.buffer().add(1 + index as usize)
+        }
+
+        unsafe fn table_entry_mut(&mut self, index: u32) -> *mut Block {
+            debug_assert!(index < self.table_entries());
+            &mut *self.buffer_mut().add(1 + index as usize)
+        }
+
+        unsafe fn block(&self, index: u32) -> *const Block {
             debug_assert!(index < self.blocks());
             &*self
                 .buffer()
                 .add((1 + self.table_entries() + index) as usize)
         }
 
-        unsafe fn block_mut(&mut self, index: u32) -> &mut Block {
+        unsafe fn block_mut(&mut self, index: u32) -> *mut Block {
             debug_assert!(index < self.blocks());
             &mut *self
                 .buffer_mut()
                 .add((1 + self.table_entries() + index) as usize)
         }
 
-        unsafe fn table_entry(&self, index: u32) -> &Block {
-            debug_assert!(index < self.table_entries());
-            &*self.buffer().add(1 + index as usize)
+        fn init<R: Rng>(&mut self, ones: u32, rng: &mut R) {
+            unsafe {
+                self.header_mut().write(self.compute_header_block());
+            }
+
+            for i in 0..self.table_entries() {
+                unsafe {
+                    self.table_entry_mut(i).write(Block::random(ones, rng));
+                }
+            }
+
+            for i in 0..self.blocks() {
+                unsafe {
+                    self.block_mut(i).write(Block::default());
+                }
+            }
         }
 
-        unsafe fn init_header_block(&mut self) {
-            *self.buffer_mut() = Block {
+        fn compute_header_block(&self) -> Block {
+            Block {
                 data: [
-                    0xf100f001u32.to_le(),
+                    MAGIC_NUMBER.to_le(),
                     BLOCKS_PER_ELEM.to_le(),
                     TABLE_ENTRIES_PER_BLOCK.to_le(),
                     self.blocks().to_le(),
@@ -156,29 +239,48 @@ mod private_filter {
                     0,
                     0,
                 ],
-            };
+            }
+        }
+
+        fn parse_header_block(block: &Block) -> Result<(u32, u32), ()> {
+            if u32::from_le(block.data[0]) != MAGIC_NUMBER {
+                return Err(()); // Bad magic number
+            }
+
+            if u32::from_le(block.data[1]) != BLOCKS_PER_ELEM {
+                return Err(()); // Serialized BLOCKS_PER_ELEM doesn't match expected value
+            }
+
+            if u32::from_le(block.data[2]) != TABLE_ENTRIES_PER_BLOCK {
+                return Err(()); // Serialized TABLE_ENTRIES_PER_BLOCK doesn't match expected value
+            }
+
+            let blocks = u32::from_le(block.data[3]);
+            let table_entries = u32::from_le(block.data[4]);
+            Ok((blocks, table_entries))
         }
 
         fn query_block_for_hash(&self, hash: u64) -> (Block, u64) {
-            let (index0, hash) = extract_index_from_hash(hash, self.table_entries());
-            let mut block = unsafe { self.table_entry(index0) }.clone();
             let mut hash = hash;
 
-            for _ in 1..TABLE_ENTRIES_PER_BLOCK {
+            let to_merge = (0..TABLE_ENTRIES_PER_BLOCK).map(|_| {
                 let (index, hash2) = extract_index_from_hash(hash, self.table_entries());
-                block.merge(unsafe { self.table_entry(index) });
                 hash = hash2;
-            }
+                unsafe { &*self.table_entry(index) }
+            });
 
+            let block = Block::merge_many(to_merge);
             (block, hash)
         }
 
         fn to_bytes(&self) -> &[u8] {
-            let bytes = Block::BYTES * (1 + self.table_entries() + self.blocks()) as usize;
+            let bytes = Block::BYTES * self.buffer_len() as usize;
             unsafe { slice::from_raw_parts(self.buffer() as *const u8, bytes) }
         }
     }
 }
+
+use private_filter::Filter as PrivateFilter;
 
 trait Filter<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32> {
     fn hash_bits(&self) -> u32;
@@ -193,7 +295,7 @@ trait Filter<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32> {
 }
 
 impl<
-        F: private_filter::Filter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>,
+        F: PrivateFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>,
         const BLOCKS_PER_ELEM: u32,
         const TABLE_ENTRIES_PER_BLOCK: u32,
     > Filter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK> for F
@@ -207,10 +309,10 @@ impl<
         let mut hash = hash;
 
         for _ in 0..BLOCKS_PER_ELEM {
-            let (block, hash2) = self.query_block_for_hash(hash);
+            let (query_block, hash2) = self.query_block_for_hash(hash);
             let (index, hash3) = extract_index_from_hash(hash2, self.blocks());
             unsafe {
-                self.block_mut(index).merge(&block);
+                (*self.block_mut(index)).merge(&query_block);
             }
             hash = hash3;
         }
@@ -222,7 +324,7 @@ impl<
         for _ in 0..BLOCKS_PER_ELEM {
             let (block, hash2) = self.query_block_for_hash(hash);
             let (index, hash3) = extract_index_from_hash(hash2, self.blocks());
-            if !unsafe { self.block(index).contains(&block) } {
+            if !unsafe { (*self.block(index)).contains(&block) } {
                 return false;
             }
             hash = hash3;
@@ -274,39 +376,35 @@ impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
         ones: u32,
         rng: &mut R,
     ) -> VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK> {
-        let mut buffer = Vec::<Block>::with_capacity((  blocks + table_entries) as usize);
+        Self::checked_new(blocks, table_entries, ones, rng).unwrap_or_else(|_error| {
+            panic!("rats!");
+        })
+    }
 
-        for i in 0..table_entries {
-            unsafe {
-                std::ptr::write(
-                    buffer.as_mut_ptr().add(i as usize),
-                    Block::random(ones, rng),
-                );
-            }
-        }
+    pub fn checked_new<R: Rng>(
+        blocks: u32,
+        table_entries: u32,
+        ones: u32,
+        rng: &mut R,
+    ) -> Result<VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>, ()> {
+        let len = Self::buffer_len_assert_bounds(blocks, table_entries)?;
 
-        for i in 0..blocks {
-            unsafe {
-                std::ptr::write(
-                    buffer.as_mut_ptr().add((table_entries + i) as usize),
-                    Block::default(),
-                );
-            }
-        }
+        let mut buffer = Vec::<Block>::with_capacity(len as usize);
+        unsafe { buffer.set_len(len as usize) };
 
-        unsafe {
-            buffer.set_len((blocks + table_entries) as usize);
-        }
-
-        VecFilter {
+        let mut filter = VecFilter {
             buffer,
             table_entries,
-        }
+        };
+
+        filter.init(ones, rng);
+
+        Ok(filter)
     }
 }
 
 impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
-    private_filter::Filter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
+    PrivateFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
     for VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
 {
     fn buffer(&self) -> *const Block {
@@ -318,7 +416,80 @@ impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
     }
 
     fn blocks(&self) -> u32 {
-        (self.buffer.len() - (self.table_entries() as usize)) as u32
+        (self.buffer.len() as u32) - self.table_entries() - 1
+    }
+
+    fn table_entries(&self) -> u32 {
+        self.table_entries
+    }
+}
+
+pub struct RawFilter<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32> {
+    buffer: *mut Block,
+    blocks: u32,
+    table_entries: u32,
+}
+
+impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
+    RawFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
+{
+    pub fn total_blocks(blocks: u32, table_entries: u32) -> u32 {
+        1 + blocks + table_entries
+    }
+
+    pub fn new<R: Rng>(
+        buffer: *mut Block,
+        blocks: u32,
+        table_entries: u32,
+        ones: u32,
+        rng: &mut R,
+    ) -> RawFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK> {
+        let mut filter = RawFilter {
+            buffer,
+            blocks,
+            table_entries,
+        };
+        filter.init(ones, rng);
+        filter
+    }
+
+    pub unsafe fn from_raw_parts(
+        buffer: *mut Block,
+        len: usize,
+    ) -> Result<RawFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>, ()> {
+        if len == 0 {
+            return Err(()); // No header block
+        }
+
+        let (blocks, table_entries) = Self::parse_header_block(&*buffer)?;
+        let buffer_len = Self::buffer_len_assert_bounds(blocks, table_entries)?;
+
+        if len < buffer_len as usize {
+            return Err(()); // Buffer insufficiently long
+        }
+
+        Ok(RawFilter {
+            buffer,
+            blocks,
+            table_entries,
+        })
+    }
+}
+
+impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
+    PrivateFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
+    for RawFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
+{
+    fn buffer(&self) -> *const Block {
+        self.buffer
+    }
+
+    fn buffer_mut(&mut self) -> *mut Block {
+        self.buffer
+    }
+
+    fn blocks(&self) -> u32 {
+        self.blocks
     }
 
     fn table_entries(&self) -> u32 {

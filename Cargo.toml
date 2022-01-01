@@ -9,4 +9,4 @@ name = "harness"
 path = "src/bin.rs"
 
 [dependencies]
-rand = "0.8.4"
+rand = "^0.8.4"
