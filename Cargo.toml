@@ -3,3 +3,10 @@ name = "floof"
 version = "0.1.0"
 authors = ["Adam Richardson <richardson.adams@gmail.com>"]
 edition = "2018"
+
+[[bin]]
+name = "harness"
+path = "src/bin.rs"
+
+[dependencies]
+rand = "0.8.4"

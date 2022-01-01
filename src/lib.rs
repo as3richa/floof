@@ -1,143 +1,214 @@
+#![allow(clippy::missing_safety_doc)]
+#![feature(min_const_generics)]
 #![feature(maybe_uninit_extra)]
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-use core::arch::x86_64::{__m256i, _mm256_or_si256, _mm256_setzero_si256, _mm256_testc_si256};
-
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-use core::mem::transmute;
+use core::arch::x86_64::{
+    __m256i, _mm256_load_si256, _mm256_or_si256, _mm256_store_si256, _mm256_testc_si256,
+};
 
 use rand::Rng;
 
-use core::mem::{size_of, MaybeUninit};
-use core::ptr::drop_in_place;
+use core::mem::MaybeUninit;
+use std::io::{Result as IoResult, Write};
 
-#[derive(Clone)]
-#[repr(align(64))]
+#[derive(Clone, Default)]
+#[repr(C, align(64))]
 pub struct Block {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    data: [__m256i; 2],
-
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    data: [u32; 16],
+    data: [u32; Block::WORDS],
 }
 
 impl Block {
-    pub fn new() -> Block {
-        Block {
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            data: [unsafe { _mm256_setzero_si256() }; 2],
+    const WORDS: usize = 16;
+    const BYTES: usize = 64;
+    const BITS: usize = 512;
+    pub fn random<R: Rng>(ones: u32, rng: &mut R) -> Block {
+        assert!(ones <= Block::BITS as u32);
 
-            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-            data: [0; 16],
-        }
-    }
-
-    pub fn random<R: Rng>(ones: u8, rng: &mut R) -> Block {
-        let mut one_bits: [MaybeUninit<u16>; 256] = unsafe { MaybeUninit::uninit().assume_init() };
+        let mut one_bits: [MaybeUninit<u16>; Block::BITS] =
+            unsafe { MaybeUninit::uninit().assume_init() };
 
         for (bit, ptr) in one_bits[0..(ones as usize)].iter_mut().enumerate() {
             ptr.write(bit as u16);
         }
 
         let mut i = (ones as usize) + 1;
-        let mut w = (rng.gen::<f64>().ln()/(ones as f64)).exp();
+        let mut w = (rng.gen::<f64>().ln() / (ones as f64)).exp();
 
-        while i < 512 {
-            i += (rng.gen::<f64>().ln()/(1.0 - w).ln()).floor() as usize;
-            if i < 512 {
-                one_bits[rng.gen_range(0..(ones as usize))] = MaybeUninit::new(i as u16);
-                w*= (rng.gen::<f64>().ln() / (ones as f64)).exp();
+        while i < Block::BITS {
+            i += (rng.gen::<f64>().ln() / (1.0 - w).ln()).floor() as usize;
+
+            if i < Block::BITS {
+                let j = rng.gen_range(0..(ones as usize));
+                one_bits[j].write(i as u16);
+                w *= (rng.gen::<f64>().ln() / (ones as f64)).exp();
             }
         }
 
-        let mut data: [u32; 16] = [0; 16];
+        let mut data: [u32; Block::WORDS] = [0; Block::WORDS];
 
         for ptr in one_bits[0..(ones as usize)].iter_mut() {
             let index = unsafe { ptr.read() };
             data[(index as usize) / 32] |= 1 << ((index as usize) % 32);
-
-            unsafe {
-                drop_in_place(ptr.as_mut_ptr());
-            }
         }
 
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        {
-            Block {
-                data: unsafe { transmute::<_, [__m256i; 2]>(data) },
-            }
-        }
+        Block { data }
+    }
 
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-        {
-            Block { data: data }
-        }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe fn load_mm256i(&self, index: usize) -> __m256i {
+        debug_assert!(index < 2);
+        _mm256_load_si256(&self.data[index * 8] as *const u32 as *const __m256i)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe fn store_mm256i(&mut self, index: usize, value: __m256i) {
+        debug_assert!(index < 2);
+        _mm256_store_si256(&mut self.data[index * 8] as *mut u32 as *mut __m256i, value);
     }
 
     fn merge(&mut self, block: &Block) {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         for i in 0..2 {
-            self.data[i] = unsafe { _mm256_or_si256(self.data[i], block.data[i]) };
+            unsafe {
+                let merged = _mm256_or_si256(self.load_mm256i(i), block.load_mm256i(i));
+                self.store_mm256i(i, merged);
+            }
         }
 
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-        for i in 0..16 {
+        for i in 0..Block::WORDS {
             self.data[i] |= block.data[i];
         }
     }
 
     fn contains(&self, block: &Block) -> bool {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        {
-            for i in 0..2 {
-                if unsafe { _mm256_testc_si256(self.data[i], block.data[i]) } == 0 {
-                    return false;
-                }
+        for i in 0..2 {
+            if unsafe { _mm256_testc_si256(self.load_mm256i(i), block.load_mm256i(i)) } == 0 {
+                return false;
             }
-
-            return true;
         }
 
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-        {
-            for i in 0..16 {
-                if ((!self.data[i]) & block.data[i]) != 0 {
-                    return false;
-                }
+        for i in 0..Block::WORDS {
+            if ((!self.data[i]) & block.data[i]) != 0 {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+mod private_filter {
+    use crate::{extract_index_from_hash, Block};
+
+    use core::slice;
+
+    pub trait Filter<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32> {
+        fn blocks(&self) -> u32;
+        fn table_entries(&self) -> u32;
+
+        fn buffer(&self) -> *const Block;
+        fn buffer_mut(&mut self) -> *mut Block;
+
+        fn buffer_len(&self) -> u32 {
+            1 + self.blocks() + self.table_entries()
+        }
+
+        unsafe fn block(&self, index: u32) -> &Block {
+            debug_assert!(index < self.blocks());
+            &*self
+                .buffer()
+                .add((1 + self.table_entries() + index) as usize)
+        }
+
+        unsafe fn block_mut(&mut self, index: u32) -> &mut Block {
+            debug_assert!(index < self.blocks());
+            &mut *self
+                .buffer_mut()
+                .add((1 + self.table_entries() + index) as usize)
+        }
+
+        unsafe fn table_entry(&self, index: u32) -> &Block {
+            debug_assert!(index < self.table_entries());
+            &*self.buffer().add(1 + index as usize)
+        }
+
+        unsafe fn init_header_block(&mut self) {
+            *self.buffer_mut() = Block {
+                data: [
+                    0xf100f001u32.to_le(),
+                    BLOCKS_PER_ELEM.to_le(),
+                    TABLE_ENTRIES_PER_BLOCK.to_le(),
+                    self.blocks().to_le(),
+                    self.table_entries().to_le(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            };
+        }
+
+        fn query_block_for_hash(&self, hash: u64) -> (Block, u64) {
+            let (index0, hash) = extract_index_from_hash(hash, self.table_entries());
+            let mut block = unsafe { self.table_entry(index0) }.clone();
+            let mut hash = hash;
+
+            for _ in 1..TABLE_ENTRIES_PER_BLOCK {
+                let (index, hash2) = extract_index_from_hash(hash, self.table_entries());
+                block.merge(unsafe { self.table_entry(index) });
+                hash = hash2;
             }
 
-            return true;
+            (block, hash)
+        }
+
+        fn to_bytes(&self) -> &[u8] {
+            let bytes = Block::BYTES * (1 + self.table_entries() + self.blocks()) as usize;
+            unsafe { slice::from_raw_parts(self.buffer() as *const u8, bytes) }
         }
     }
 }
 
-pub trait InternalFilter {
-    fn blocks(&self) -> usize;
-    fn blocks_per_elem(&self) -> u32;
-    unsafe fn block(&self, i: usize) -> &Block;
-    unsafe fn block_mut(&mut self, index: usize) -> &mut Block;
-
-    fn table_entries(&self) -> usize;
-    fn table_entries_per_block(&self) -> u32;
-    unsafe fn table_entry(&self, index: usize) -> &Block;
-}
-
-pub trait Filter {
+trait Filter<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32> {
     fn hash_bits(&self) -> u32;
+
     fn insert_hash(&mut self, hash: u64);
     fn contains_hash(&self, hash: u64) -> bool;
+
+    fn insert<A: Hashable>(&mut self, value: A);
+    fn contains<A: Hashable>(&self, value: A) -> bool;
+
+    fn serialize<W: Write>(&self, output: &mut W) -> IoResult<()>;
 }
 
-impl<T: InternalFilter> Filter for T {
+impl<
+        F: private_filter::Filter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>,
+        const BLOCKS_PER_ELEM: u32,
+        const TABLE_ENTRIES_PER_BLOCK: u32,
+    > Filter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK> for F
+{
     fn hash_bits(&self) -> u32 {
-        (bits(self.table_entries()) * self.table_entries_per_block() + bits(self.blocks()))
-            * self.blocks_per_elem()
+        (bits(self.table_entries()) * TABLE_ENTRIES_PER_BLOCK + bits(self.blocks()))
+            * BLOCKS_PER_ELEM
     }
 
-    fn insert_hash(&mut self, mut hash: u64) {
-        for _ in 0..self.blocks_per_elem() {
-            let (block, hash2) = compute_block(self, hash);
-            let (index, hash3) = extract_from_hash(hash2, self.blocks());
+    fn insert_hash(&mut self, hash: u64) {
+        let mut hash = hash;
+
+        for _ in 0..BLOCKS_PER_ELEM {
+            let (block, hash2) = self.query_block_for_hash(hash);
+            let (index, hash3) = extract_index_from_hash(hash2, self.blocks());
             unsafe {
                 self.block_mut(index).merge(&block);
             }
@@ -145,105 +216,112 @@ impl<T: InternalFilter> Filter for T {
         }
     }
 
-    fn contains_hash(&self, mut hash: u64) -> bool {
-        for _ in 0..self.blocks_per_elem() {
-            let (block, hash2) = compute_block(self, hash);
-            let (index, hash3) = extract_from_hash(hash2, self.blocks());
+    fn contains_hash(&self, hash: u64) -> bool {
+        let mut hash = hash;
+
+        for _ in 0..BLOCKS_PER_ELEM {
+            let (block, hash2) = self.query_block_for_hash(hash);
+            let (index, hash3) = extract_index_from_hash(hash2, self.blocks());
             if !unsafe { self.block(index).contains(&block) } {
                 return false;
             }
             hash = hash3;
         }
-        return true;
+
+        true
+    }
+
+    fn insert<A: Hashable>(&mut self, value: A) {
+        self.insert_hash(value.hash());
+    }
+
+    fn contains<A: Hashable>(&self, value: A) -> bool {
+        self.contains_hash(value.hash())
+    }
+
+    fn serialize<W: Write>(&self, output: &mut W) -> IoResult<()> {
+        output.write_all(self.to_bytes())?;
+        Ok(())
     }
 }
 
-fn compute_block<T: InternalFilter>(filter: &T, mut hash: u64) -> (Block, u64) {
-    let (index0, hash0) = extract_from_hash(hash, filter.table_entries());
-    let mut block = unsafe { filter.table_entry(index0) }.clone();
-    hash = hash0;
-
-    for _ in 1..filter.table_entries_per_block() {
-        let (index, hash2) = extract_from_hash(hash, filter.table_entries());
-        block.merge(unsafe { filter.table_entry(index) });
-        hash = hash2;
-    }
-
-    (block, hash)
-}
-
-fn extract_from_hash(hash: u64, n: usize) -> (usize, u64) {
+fn extract_index_from_hash(hash: u64, n: u32) -> (u32, u64) {
     let bits = bits(n);
     let unscaled = hash & ((1 << bits) - 1);
     let scaled = (unscaled as f64) * (n as f64) / ((1 << bits) as f64);
-    (scaled as usize, hash >> bits)
+    (scaled as u32, hash >> bits)
 }
 
-fn bits(n: usize) -> u32 {
-    ((8 * size_of::<usize>()) as u32) - n.leading_zeros()
+fn bits(n: u32) -> u32 {
+    32 - n.leading_zeros()
 }
 
 pub trait Hashable {
     fn hash(&self) -> u64;
 }
 
-pub trait TypedFilter<A> {
-    fn insert(&mut self, value: A);
-
-    fn contains(&self, value: A) -> bool;
+pub struct VecFilter<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32> {
+    buffer: Vec<Block>,
+    table_entries: u32,
 }
 
-impl<F: Filter, A: Hashable> TypedFilter<A> for F {
-    fn insert(&mut self, value: A) {
-        self.insert_hash(value.hash())
-    }
+impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
+    VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
+{
+    pub fn new<R: Rng>(
+        blocks: u32,
+        table_entries: u32,
+        ones: u32,
+        rng: &mut R,
+    ) -> VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK> {
+        let mut buffer = Vec::<Block>::with_capacity((  blocks + table_entries) as usize);
 
-    fn contains(&self, value: A) -> bool {
-        self.contains_hash(value.hash())
-    }
-}
+        for i in 0..table_entries {
+            unsafe {
+                std::ptr::write(
+                    buffer.as_mut_ptr().add(i as usize),
+                    Block::random(ones, rng),
+                );
+            }
+        }
 
-pub struct BlockedFilter {
-    all_blocks: Vec<Block>,
-    table_entries: usize,
-}
+        for i in 0..blocks {
+            unsafe {
+                std::ptr::write(
+                    buffer.as_mut_ptr().add((table_entries + i) as usize),
+                    Block::default(),
+                );
+            }
+        }
 
-impl BlockedFilter {
-    pub fn new(blocks: usize, table_entries: usize, bits_per_entry: u32) -> BlockedFilter {
-        BlockedFilter {
-            all_blocks: vec![Block::new(); blocks + table_entries],
-            table_entries: 0,
+        unsafe {
+            buffer.set_len((blocks + table_entries) as usize);
+        }
+
+        VecFilter {
+            buffer,
+            table_entries,
         }
     }
 }
 
-impl InternalFilter for BlockedFilter {
-    fn blocks(&self) -> usize {
-        self.all_blocks.len() - self.table_entries()
+impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
+    private_filter::Filter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
+    for VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
+{
+    fn buffer(&self) -> *const Block {
+        self.buffer.as_ptr()
     }
 
-    fn blocks_per_elem(&self) -> u32 {
-        1
+    fn buffer_mut(&mut self) -> *mut Block {
+        self.buffer.as_mut_ptr()
     }
 
-    unsafe fn block(&self, index: usize) -> &Block {
-        self.all_blocks.get_unchecked(self.table_entries + index)
+    fn blocks(&self) -> u32 {
+        (self.buffer.len() - (self.table_entries() as usize)) as u32
     }
 
-    unsafe fn block_mut(&mut self, index: usize) -> &mut Block {
-        self.all_blocks
-            .get_unchecked_mut(self.table_entries + index)
-    }
-
-    fn table_entries(&self) -> usize {
+    fn table_entries(&self) -> u32 {
         self.table_entries
-    }
-
-    fn table_entries_per_block(&self) -> u32 {
-        1
-    }
-
-    unsafe fn table_entry(&self, index: usize) -> &Block {
-        self.all_blocks.get_unchecked(index)
     }
 }
