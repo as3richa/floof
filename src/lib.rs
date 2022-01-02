@@ -15,6 +15,31 @@ use core::arch::x86_64::{
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use core::mem::transmute;
 
+use core::fmt;
+
+#[derive(Clone, Copy)]
+#[non_exhaustive]
+pub enum Error {
+    MissingHeader,
+    InvalidHeader,
+    InvalidParameter,
+    TooLarge,
+    Truncated,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Error::MissingHeader => "Missing header block",
+            Error::InvalidHeader => "Invalid header block",
+            Error::InvalidParameter => "Invalid filter parameter",
+            Error::TooLarge => "Filter is too large",
+            Error::Truncated => "Filter data is truncated",
+        };
+        formatter.write_str(&message)
+    }
+}
+
 #[derive(Clone, Default)]
 #[repr(C, align(64))]
 pub struct Block {
@@ -140,7 +165,7 @@ impl Block {
 }
 
 mod private_filter {
-    use crate::{extract_index_from_hash, Block};
+    use crate::{extract_index_from_hash, Block, Error};
     use core::slice;
     use rand::Rng;
 
@@ -159,15 +184,15 @@ mod private_filter {
             1 + self.blocks() + self.table_entries()
         }
 
-        fn buffer_len_assert_bounds(blocks: u32, table_entries: u32) -> Result<u32, ()> {
+        fn buffer_len_assert_bounds(blocks: u32, table_entries: u32) -> Result<u32, Error> {
             let len = 1u32
                 .checked_add(blocks)
                 .and_then(|x| x.checked_add(table_entries))
-                .map_or(Err(()), Ok)?; // len overflows u32
+                .map_or(Err(Error::TooLarge), Ok)?;
 
             #[cfg(target_pointer_width = "16")]
             if len > usize::MAX {
-                return Err(()); // len overflows usize (possible only if usize is less than 32 bits)
+                return Err(Error::TooLarge);
             }
 
             Ok(len)
@@ -242,17 +267,17 @@ mod private_filter {
             }
         }
 
-        fn parse_header_block(block: &Block) -> Result<(u32, u32), ()> {
+        fn parse_header_block(block: &Block) -> Result<(u32, u32), Error> {
             if u32::from_le(block.data[0]) != MAGIC_NUMBER {
-                return Err(()); // Bad magic number
+                return Err(Error::InvalidHeader);
             }
 
             if u32::from_le(block.data[1]) != BLOCKS_PER_ELEM {
-                return Err(()); // Serialized BLOCKS_PER_ELEM doesn't match expected value
+                return Err(Error::InvalidParameter);
             }
 
             if u32::from_le(block.data[2]) != TABLE_ENTRIES_PER_BLOCK {
-                return Err(()); // Serialized TABLE_ENTRIES_PER_BLOCK doesn't match expected value
+                return Err(Error::InvalidParameter);
             }
 
             let blocks = u32::from_le(block.data[3]);
@@ -347,10 +372,10 @@ impl<
     }
 }
 
-fn extract_index_from_hash(hash: u64, n: u32) -> (u32, u64) {
-    let bits = bits(n);
+fn extract_index_from_hash(hash: u64, bound: u32) -> (u32, u64) {
+    let bits = bits(bound);
     let unscaled = hash & ((1 << bits) - 1);
-    let scaled = (unscaled as f64) * (n as f64) / ((1 << bits) as f64);
+    let scaled = (unscaled as f64) * (bound as f64) / ((1 << bits) as f64);
     (scaled as u32, hash >> bits)
 }
 
@@ -376,8 +401,8 @@ impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
         ones: u32,
         rng: &mut R,
     ) -> VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK> {
-        Self::checked_new(blocks, table_entries, ones, rng).unwrap_or_else(|_error| {
-            panic!("rats!");
+        Self::checked_new(blocks, table_entries, ones, rng).unwrap_or_else(|error| {
+            panic!("{}", error);
         })
     }
 
@@ -386,7 +411,7 @@ impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
         table_entries: u32,
         ones: u32,
         rng: &mut R,
-    ) -> Result<VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>, ()> {
+    ) -> Result<VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>, Error> {
         let len = Self::buffer_len_assert_bounds(blocks, table_entries)?;
 
         let mut buffer = Vec::<Block>::with_capacity(len as usize);
@@ -456,16 +481,16 @@ impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
     pub unsafe fn from_raw_parts(
         buffer: *mut Block,
         len: usize,
-    ) -> Result<RawFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>, ()> {
+    ) -> Result<RawFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>, Error> {
         if len == 0 {
-            return Err(()); // No header block
+            return Err(Error::MissingHeader);
         }
 
         let (blocks, table_entries) = Self::parse_header_block(&*buffer)?;
         let buffer_len = Self::buffer_len_assert_bounds(blocks, table_entries)?;
 
         if len < buffer_len as usize {
-            return Err(()); // Buffer insufficiently long
+            return Err(Error::Truncated);
         }
 
         Ok(RawFilter {
