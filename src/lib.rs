@@ -1,8 +1,10 @@
 #![allow(clippy::missing_safety_doc)]
 #![feature(maybe_uninit_extra)]
 #![feature(min_const_generics)]
+#![feature(vec_into_raw_parts)]
 
 use core::mem::MaybeUninit;
+use core::ops;
 use rand::Rng;
 use std::io::{Result as IoResult, Write};
 
@@ -52,7 +54,6 @@ impl Block {
     const BITS: usize = 512;
 
     pub fn random<R: Rng>(ones: u32, rng: &mut R) -> Block {
-        // FIXME: check in caller!
         debug_assert!(ones <= Block::BITS as u32);
 
         let mut one_bits: [MaybeUninit<u16>; Block::BITS] =
@@ -185,6 +186,10 @@ mod private_filter {
         }
 
         fn buffer_len_assert_bounds(blocks: u32, table_entries: u32) -> Result<u32, Error> {
+            if blocks == 0 || table_entries == 0 {
+                return Err(Error::InvalidParameter);
+            }
+
             let len = 1u32
                 .checked_add(blocks)
                 .and_then(|x| x.checked_add(table_entries))
@@ -226,7 +231,11 @@ mod private_filter {
                 .add((1 + self.table_entries() + index) as usize)
         }
 
-        fn init<R: Rng>(&mut self, ones: u32, rng: &mut R) {
+        fn initialize_new<R: Rng>(&mut self, ones: u32, rng: &mut R) -> Result<(), Error> {
+            if ones == 0 || ones > Block::BITS as u32 {
+                return Err(Error::InvalidParameter);
+            }
+
             unsafe {
                 self.header_mut().write(self.compute_header_block());
             }
@@ -242,6 +251,8 @@ mod private_filter {
                     self.block_mut(i).write(Block::default());
                 }
             }
+
+            Ok(())
         }
 
         fn compute_header_block(&self) -> Block {
@@ -387,68 +398,6 @@ pub trait Hashable {
     fn hash(&self) -> u64;
 }
 
-pub struct VecFilter<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32> {
-    buffer: Vec<Block>,
-    table_entries: u32,
-}
-
-impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
-    VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
-{
-    pub fn new<R: Rng>(
-        blocks: u32,
-        table_entries: u32,
-        ones: u32,
-        rng: &mut R,
-    ) -> VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK> {
-        Self::checked_new(blocks, table_entries, ones, rng).unwrap_or_else(|error| {
-            panic!("{}", error);
-        })
-    }
-
-    pub fn checked_new<R: Rng>(
-        blocks: u32,
-        table_entries: u32,
-        ones: u32,
-        rng: &mut R,
-    ) -> Result<VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>, Error> {
-        let len = Self::buffer_len_assert_bounds(blocks, table_entries)?;
-
-        let mut buffer = Vec::<Block>::with_capacity(len as usize);
-        unsafe { buffer.set_len(len as usize) };
-
-        let mut filter = VecFilter {
-            buffer,
-            table_entries,
-        };
-
-        filter.init(ones, rng);
-
-        Ok(filter)
-    }
-}
-
-impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
-    PrivateFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
-    for VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
-{
-    fn buffer(&self) -> *const Block {
-        self.buffer.as_ptr()
-    }
-
-    fn buffer_mut(&mut self) -> *mut Block {
-        self.buffer.as_mut_ptr()
-    }
-
-    fn blocks(&self) -> u32 {
-        (self.buffer.len() as u32) - self.table_entries() - 1
-    }
-
-    fn table_entries(&self) -> u32 {
-        self.table_entries
-    }
-}
-
 pub struct RawFilter<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32> {
     buffer: *mut Block,
     blocks: u32,
@@ -458,30 +407,35 @@ pub struct RawFilter<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: 
 impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
     RawFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
 {
-    pub fn total_blocks(blocks: u32, table_entries: u32) -> u32 {
-        1 + blocks + table_entries
-    }
-
     pub fn new<R: Rng>(
         buffer: *mut Block,
         blocks: u32,
         table_entries: u32,
         ones: u32,
         rng: &mut R,
-    ) -> RawFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK> {
+    ) -> Self {
+        Self::checked_new(buffer, blocks, table_entries, ones, rng).unwrap_or_else(|error| {
+            panic!("{}", error);
+        })
+    }
+
+    pub fn checked_new<R: Rng>(
+        buffer: *mut Block,
+        blocks: u32,
+        table_entries: u32,
+        ones: u32,
+        rng: &mut R,
+    ) -> Result<Self, Error> {
         let mut filter = RawFilter {
             buffer,
             blocks,
             table_entries,
         };
-        filter.init(ones, rng);
-        filter
+        filter.initialize_new(ones, rng)?;
+        Ok(filter)
     }
 
-    pub unsafe fn from_raw_parts(
-        buffer: *mut Block,
-        len: usize,
-    ) -> Result<RawFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>, Error> {
+    pub unsafe fn from_ptr(buffer: *mut Block, len: usize) -> Result<Self, Error> {
         if len == 0 {
             return Err(Error::MissingHeader);
         }
@@ -504,6 +458,67 @@ impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
 impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
     PrivateFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
     for RawFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
+{
+    fn buffer(&self) -> *const Block {
+        self.buffer
+    }
+
+    fn buffer_mut(&mut self) -> *mut Block {
+        self.buffer
+    }
+
+    fn blocks(&self) -> u32 {
+        self.blocks
+    }
+
+    fn table_entries(&self) -> u32 {
+        self.table_entries
+    }
+}
+
+pub struct VecFilter<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32> {
+    buffer: * mut Block,
+    blocks: u32,
+    table_entries: u32,
+}
+
+impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
+    VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
+{
+    pub fn new<R: Rng>(blocks: u32, table_entries: u32, ones: u32, rng: &mut R) -> Self {
+        Self::checked_new(blocks, table_entries, ones, rng).unwrap_or_else(|error| {
+            panic!("{}", error);
+        })
+    }
+
+    pub fn checked_new<R: Rng>(
+        blocks: u32,
+        table_entries: u32,
+        ones: u32,
+        rng: &mut R,
+    ) -> Result<Self, Error> {
+        let len = Self::buffer_len_assert_bounds(blocks, table_entries)?;
+        let (buffer, _, _) = Vec::<Block>::with_capacity(len as usize).into_raw_parts();
+        let mut filter = VecFilter { buffer, blocks, table_entries };
+        filter.initialize_new(ones, rng)?;
+        Ok(filter)
+    }
+}
+
+impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32> ops::Drop
+    for VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
+{
+    fn drop(&mut self) {
+        let len = self.buffer_len() as usize;
+        unsafe {
+            Vec::from_raw_parts(self.buffer_mut(), len, len);
+        }
+    }
+}
+
+impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
+    PrivateFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
+    for VecFilter<BLOCKS_PER_ELEM, TABLE_ENTRIES_PER_BLOCK>
 {
     fn buffer(&self) -> *const Block {
         self.buffer
