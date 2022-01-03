@@ -89,7 +89,8 @@ impl Block {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     unsafe fn load_mm256i(&self, index: usize) -> __m256i {
         debug_assert!(index < 2);
-        _mm256_load_si256(self.data.as_ptr().add(index * 8) as *const __m256i)
+        let base_ptr = self.data.as_ptr() as *const __m256i;
+        _mm256_load_si256(base_ptr.add(index))
     }
 
     fn merge(&mut self, block: &Block) {
@@ -99,7 +100,7 @@ impl Block {
             let y = _mm256_or_si256(self.load_mm256i(1), block.load_mm256i(1));
 
             _mm256_store_si256(self.data.as_mut_ptr() as *mut __m256i, x);
-            _mm256_store_si256(self.data.as_mut_ptr().add(8) as *mut __m256i, y);
+            _mm256_store_si256((self.data.as_mut_ptr() as *mut __m256i).add(1), y);
         }
 
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
@@ -119,13 +120,8 @@ impl Block {
                 y = _mm256_or_si256(y, block.load_mm256i(1));
             }
 
-            let mut data: [MaybeUninit<u32>; Block::WORDS] = MaybeUninit::uninit().assume_init();
-
-            _mm256_store_si256(data.as_mut_ptr() as *mut __m256i, x);
-            _mm256_store_si256(data.as_mut_ptr().add(8) as *mut __m256i, x);
-
             Block {
-                data: transmute(data),
+                data: transmute([x, y]),
             }
         }
 
@@ -384,9 +380,10 @@ impl<
 }
 
 fn extract_index_from_hash(hash: u64, bound: u32) -> (u32, u64) {
-    let bits = bits(bound);
+    debug_assert!(bound != 0);
+    let bits = bits(bound - 1);
     let unscaled = hash & ((1 << bits) - 1);
-    let scaled = (unscaled as f64) * (bound as f64) / ((1 << bits) as f64);
+    let scaled = (unscaled as f64) * ((bound as f64) * (-(bits as f64)).exp2());
     (scaled as u32, hash >> bits)
 }
 
@@ -477,7 +474,7 @@ impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
 }
 
 pub struct VecFilter<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32> {
-    buffer: * mut Block,
+    buffer: *mut Block,
     blocks: u32,
     table_entries: u32,
 }
@@ -499,7 +496,11 @@ impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
     ) -> Result<Self, Error> {
         let len = Self::buffer_len_assert_bounds(blocks, table_entries)?;
         let (buffer, _, _) = Vec::<Block>::with_capacity(len as usize).into_raw_parts();
-        let mut filter = VecFilter { buffer, blocks, table_entries };
+        let mut filter = VecFilter {
+            buffer,
+            blocks,
+            table_entries,
+        };
         filter.initialize_new(ones, rng)?;
         Ok(filter)
     }
@@ -534,5 +535,82 @@ impl<const BLOCKS_PER_ELEM: u32, const TABLE_ENTRIES_PER_BLOCK: u32>
 
     fn table_entries(&self) -> u32 {
         self.table_entries
+    }
+}
+
+#[cfg(test)]
+mod test {
+    mod extract_index_from_hash {
+        use crate::extract_index_from_hash;
+        use core::num::NonZeroU32;
+        use rand::Rng;
+
+        #[test]
+        fn test_extract_index_from_hash() {
+            let mut rng = rand::thread_rng();
+
+            for _ in 0..100000 {
+                let hash = rng.gen::<u64>();
+                let bound = rng.gen::<NonZeroU32>().get();
+                let (value, hash2) = extract_index_from_hash(hash, bound);
+                assert!((value as u64) < hash);
+                assert!(hash2 < hash);
+            }
+        }
+
+        #[test]
+        fn test_extract_index_from_hash_pow2() {
+            let mut rng = rand::thread_rng();
+
+            for i in 0..32 {
+                let bound = 1 << i;
+                for _ in 0..20 {
+                    let hash = rng.gen::<u64>();
+                    let (value, hash2) = extract_index_from_hash(hash, bound);
+                    assert_eq!(value, (hash as u32) & (bound - 1));
+                    assert_eq!(hash2, hash >> i);
+                }
+            }
+        }
+
+        #[test]
+        fn test_extract_index_from_hash_exhaustive() {
+            let mut rng = rand::thread_rng();
+            let bounds: [u32; 13] = [1, 2, 3, 10, 20, 50, 100, 128, 256, 500, 512, 1000, 1024];
+
+            for &bound in &bounds {
+                let mut observed = vec![false; bound as usize];
+
+                for _ in 0..(bound * 100) {
+                    let hash = rng.gen::<u64>();
+                    let (value, _) = extract_index_from_hash(hash, bound);
+                    observed[value as usize] = true;
+                }
+
+                assert!(observed.into_iter().all(|x| x));
+            }
+        }
+    }
+
+    mod vec_filter {
+        use crate::{Filter, Hashable, VecFilter};
+
+        impl Hashable for &str {
+            fn hash(&self) -> u64 {
+                use core::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                Hash::hash(self, &mut hasher);
+                hasher.finish()
+            }
+        }
+
+        #[test]
+        fn test_simple() {
+            let mut rng = rand::thread_rng();
+            let mut filter = VecFilter::<1, 1>::new(4096, 512, 10, &mut rng);
+            assert!(!filter.contains("adam"));
+            filter.insert("adam");
+            assert!(filter.contains("adam"));
+        }
     }
 }
